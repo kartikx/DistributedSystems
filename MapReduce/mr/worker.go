@@ -45,7 +45,58 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
-	CallMapTask()
+	mr := CallMapTask()
+
+	// Now you may start working on your file.
+	workerFileName := stubFileName + "-" + mr.WorkerID // Of the form mr-2
+
+	// The input files are in the main/ directory.
+	file, err := os.Open("../main/" + mr.FileName)
+	if err != nil {
+		log.Fatalln("[Map Worker unable to open file]", err)
+	}
+
+	intermedFiles := make([]*os.File, mr.NReduce)
+
+	// Create intermediate files.
+	for i := 1; i <= mr.NReduce; i++ {
+		intermedFiles[i], err = os.Create(workerFileName + "-" + strconv.Itoa(i))
+		if err != nil {
+			log.Fatalln("[Map Worker unable to create files]", err)
+		}
+	}
+
+	// File opened successfully
+	contents, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalln("[Map Worker unable to read file content]", err)
+	}
+	file.Close()
+
+	// Call Map Function
+	kva := mapf(mr.FileName, string(contents))
+
+	// iterate on Kva  and for each key find the hash value
+	// and write to intermediate file output.
+	}
+	}
+
+	// Close the intermediate files.
+	for _, f := range intermedFiles {
+		f.Close()
+	}
+		// In the intermediate file, you're supposed to write JSON.
+		enc := json.NewEncoder(intermedFiles[writeIndex])
+		err := enc.Encode(kv)
+		if err != nil {
+			log.Fatalln("[Unable to encode JSON]", err)
+		}
+	}
+
+	// Close the intermediate files.
+	for _, f := range intermedFiles {
+		f.Close()
+	}
 
 	CallReduceTask()
 }
