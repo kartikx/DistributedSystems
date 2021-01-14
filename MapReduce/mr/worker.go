@@ -8,12 +8,15 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
 
 const (
-	stubFileName = "mr"
+	StubFileName     = "mr"
+	ErrNoMapTasks    = "No Map Tasks left"
+	ErrNoReduceTasks = "No Reduce Tasks left"
 )
 
 //
@@ -22,6 +25,20 @@ const (
 type KeyValue struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type KeyValueArray []KeyValue
+
+func (kva KeyValueArray) Len() int {
+	return len(kva)
+}
+
+func (kva KeyValueArray) Swap(i, j int) {
+	kva[i], kva[j] = kva[j], kva[i]
+}
+
+func (kva KeyValueArray) Less(i, j int) bool {
+	return kva[i].Key < kva[j].Key
 }
 
 //
@@ -55,8 +72,30 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	mr := CallMapTask()
 
+	// Valid response
+	if mr.FileName != "" {
+		fmt.Println("Allocating Map Task")
+		MapWorker(mr, mapf)
+		return
+	}
+
+	// fmt.Println("Map Tasks are over")
+	// Reduce Workers
+	rr := CallReduceTask()
+
+	if rr.FileNum != "" {
+		fmt.Println("Allocating Reduce Task")
+		ReduceWorker(rr, reducef)
+		return
+	}
+
+	fmt.Println("Received Invalid Reduce Response")
+	return
+}
+
+func MapWorker(mr *MapResponse, mapf func(string, string) []KeyValue) {
 	// Now you may start working on your file.
-	workerFileName := stubFileName + "-" + mr.WorkerID // Of the form mr-0
+	workerFileName := StubFileName + "-" + mr.WorkerID // Of the form mr-0
 
 	// The input files are in the main/ directory.
 	file, err := os.Open("../main/" + mr.FileName)
@@ -102,8 +141,61 @@ func Worker(mapf func(string, string) []KeyValue,
 	for _, f := range intermedFiles {
 		f.Close()
 	}
+}
 
-	// CallReduceTask()
+func ReduceWorker(rr *ReduceResponse, reducef func(string, []string) string) {
+	// Reponse contains the column number to scan across.
+	// Scan all, store in slice and sort.
+	// Then call reduce. Read up on how you should sort.
+
+	intermedOut := []KeyValue{}
+
+	// TODO a better way would be to use rr.NWorkers.
+	for i := 0; ; i++ {
+		fileName := fmt.Sprintf("%s-%d-%s.txt", "mr", i, rr.FileNum)
+		// fmt.Println("Trying to open:", fileName)
+		file, err := os.Open(fileName)
+
+		if err != nil {
+			// fmt.Println("Failed at: ", fileName)
+			break
+		}
+
+		dec := json.NewDecoder(file)
+		kv := KeyValue{}
+		for {
+			if err = dec.Decode(&kv); err != nil {
+				break
+			}
+			intermedOut = append(intermedOut, kv)
+		}
+	}
+
+	// fmt.Println("Going to sort")
+	sort.Sort(KeyValueArray(intermedOut))
+
+	outFileName := fmt.Sprintf("mr-out-%s.txt", rr.FileNum)
+	outFile, err := os.Create(outFileName)
+	if err != nil {
+		log.Fatalln("[Unable to create Reduce Output file]", err)
+	}
+
+	for i, j := 0, 0; i < len(intermedOut); {
+		keySlice := []string{}
+
+		for j < len(intermedOut) && intermedOut[i].Key == intermedOut[j].Key {
+			keySlice = append(keySlice, intermedOut[j].Key)
+			j += 1
+		}
+
+		count := reducef(intermedOut[i].Key, keySlice)
+
+		fmt.Fprintf(outFile, "%s %s\n", intermedOut[i].Key, count)
+
+		i = j
+	}
+
+	return
 }
 
 // ? Asks the Master for a Map Task()
@@ -123,14 +215,20 @@ func CallMapTask() *MapResponse {
 	}
 }
 
-func CallReduceTask() {
-	var err error
-	for {
-		//
+func CallReduceTask() *ReduceResponse {
+	fmt.Println("Calling Reduce Task")
 
-		if err != nil {
-			time.Sleep(1 * time.Second)
+	rreq := &ReduceRequest{}
+	rresp := &ReduceResponse{}
+
+	for {
+		ok := call("Master.ReduceTask", rreq, rresp)
+
+		if ok {
+			return rresp
 		}
+
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -174,7 +272,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
+	if err == nil || err.Error() == ErrNoMapTasks || err.Error() == ErrNoReduceTasks {
 		return true
 	}
 

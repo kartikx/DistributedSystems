@@ -40,6 +40,8 @@ type ReduceRequest struct {
 }
 
 type ReduceResponse struct {
+	FileNum  string
+	NWorkers int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
