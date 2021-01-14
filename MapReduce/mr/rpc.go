@@ -33,6 +33,7 @@ type MapRequest struct {
 type MapResponse struct {
 	FileName string
 	WorkerID string
+	NReduce  int
 }
 
 type ReduceRequest struct {

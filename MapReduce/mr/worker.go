@@ -1,19 +1,27 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"strconv"
 	"time"
+)
+
+const (
+	stubFileName = "mr"
 )
 
 //
 // Map functions return a slice of KeyValue.
 //
 type KeyValue struct {
-	Key   string
-	Value string
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 //
@@ -48,7 +56,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	mr := CallMapTask()
 
 	// Now you may start working on your file.
-	workerFileName := stubFileName + "-" + mr.WorkerID // Of the form mr-2
+	workerFileName := stubFileName + "-" + mr.WorkerID // Of the form mr-0
 
 	// The input files are in the main/ directory.
 	file, err := os.Open("../main/" + mr.FileName)
@@ -58,9 +66,9 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	intermedFiles := make([]*os.File, mr.NReduce)
 
-	// Create intermediate files.
-	for i := 1; i <= mr.NReduce; i++ {
-		intermedFiles[i], err = os.Create(workerFileName + "-" + strconv.Itoa(i))
+	// Create intermediate files. 0 based indexing of the form mr-0-0
+	for i := 0; i < mr.NReduce; i++ {
+		intermedFiles[i], err = os.Create(workerFileName + "-" + strconv.Itoa(i) + ".txt")
 		if err != nil {
 			log.Fatalln("[Map Worker unable to create files]", err)
 		}
@@ -78,13 +86,10 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// iterate on Kva  and for each key find the hash value
 	// and write to intermediate file output.
-	}
-	}
 
-	// Close the intermediate files.
-	for _, f := range intermedFiles {
-		f.Close()
-	}
+	for _, kv := range kva {
+		writeIndex := ihash(kv.Key) % mr.NReduce
+
 		// In the intermediate file, you're supposed to write JSON.
 		enc := json.NewEncoder(intermedFiles[writeIndex])
 		err := enc.Encode(kv)
@@ -98,11 +103,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		f.Close()
 	}
 
-	CallReduceTask()
+	// CallReduceTask()
 }
 
 // ? Asks the Master for a Map Task()
-func CallMapTask() {
+func CallMapTask() *MapResponse {
 	var ok bool
 
 	mreq := &MapRequest{}
@@ -111,9 +116,10 @@ func CallMapTask() {
 	for {
 		ok = call("Master.MapTask", mreq, mresp)
 
-		if !ok {
-			time.Sleep(1 * time.Second)
+		if ok {
+			return mresp
 		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -156,6 +162,8 @@ func CallExample() {
 // usually returns true.
 // returns false if something goes wrong.
 //
+
+// TODO understand this (again)
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
