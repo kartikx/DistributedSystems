@@ -2,7 +2,6 @@ package mr
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -34,30 +33,30 @@ type ReduceTask struct {
 }
 
 type Master struct {
-	nReduce     int8
-	mapTasks    []MapTask
-	reduceTasks []ReduceTask
-	workerCount int8
-	mut         sync.Mutex
+	nReduce         uint8
+	mapTasks        []MapTask    // List of Map Tasks
+	reduceTasks     []ReduceTask // List of Reduce Tasks
+	workerCount     uint8        //ID
+	mut             sync.Mutex
+	doneMut         sync.Mutex
+	mapFinished     bool
+	reduceFinished  bool
+	completedJobs   uint8
+	allJobsComplete bool
 	// jobStatus []JobInfo
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
-// This function modifies shared Master data.
-// Hence, use Mutex for safety.
 func (m *Master) getNextMapTask(workerID int) (string, error) {
-	m.mut.Lock()
+	// fmt.Prinln("GetNextMapTask")
+	if m.mapFinished {
+		// fmt.Println("Map Tasks Finished Already")
+		return "", errors.New(ErrMapAlreadyFinished)
+	}
+
+	// TODO currently, only one goroutine can be in this loop.
+	// TODO maybe i can optimize that.
+	// TODO A solution could be to have mutex only on the lines
+	// TODO that modify shared data.
 	for i := range m.mapTasks {
 		task := &m.mapTasks[i]
 		if !task.status {
@@ -65,33 +64,33 @@ func (m *Master) getNextMapTask(workerID int) (string, error) {
 			task.status = true
 			task.startTime = time.Now()
 			m.workerCount += 1
-
-			m.mut.Unlock()
+			// fmt.Println(m.workerCount)
 			return task.file, nil
 		}
 	}
 
-	// To allow Reduce Workers count to start from 0.
+	// fmt.Println("Setting m.MapFinished")
 	m.workerCount = 0
-	m.mut.Unlock()
-	return "", errors.New(ErrNoMapTasks)
+	m.mapFinished = true
+
+	return "", errors.New(ErrMapAlreadyFinished)
 }
 
 func (m *Master) MapTask(req *MapRequest, resp *MapResponse) error {
+	m.mut.Lock()
+
 	// Worker ID is the 0 based index.
 	workerID := int(m.workerCount)
 
 	// TODO Optimize how to find the next available task.
+	// TODO Could use a different Data Structure.
 	nextTaskFile, err := m.getNextMapTask(workerID)
+	m.mut.Unlock()
+
 	if err != nil {
 		return err
 	}
 
-	// ? I don't think a separate structure is needed.
-	// jobInfo := JobInfo{file: nextTaskFile, start: time.Now(), finished: false}
-	// m.jobStatus = append(m.jobStatus, jobInfo)
-
-	fmt.Printf("Allocating Worker %d, File: %s\n", workerID, nextTaskFile)
 	resp.FileName = nextTaskFile
 	resp.NReduce = int(m.nReduce)
 	resp.WorkerID = strconv.Itoa(workerID)
@@ -100,7 +99,19 @@ func (m *Master) MapTask(req *MapRequest, resp *MapResponse) error {
 }
 
 func (m *Master) getNextReduceTask(workerID int) (string, error) {
-	m.mut.Lock()
+	// fmt.Println("GetNextReduceTask")
+	if !m.mapFinished {
+		return "", errors.New(ErrMapNotFinished)
+	}
+
+	m.doneMut.Lock()
+	isFinished := m.reduceFinished
+	m.doneMut.Unlock()
+	if isFinished {
+		// fmt.Println("Reduce has already finished")
+		return "", errors.New(ErrNoReduceTasks)
+	}
+
 	for i := range m.reduceTasks {
 		task := &m.reduceTasks[i]
 		if !task.status {
@@ -109,34 +120,53 @@ func (m *Master) getNextReduceTask(workerID int) (string, error) {
 			task.startTime = time.Now()
 			m.workerCount += 1
 
-			m.mut.Unlock()
 			return task.file, nil
 		}
 	}
 
-	m.mut.Unlock()
+	m.doneMut.Lock()
 
-	// TODO can use this as an indication that all tasks have finished.
+	// Indicates that all Reduce Jobs have been allocated to a worker.
+	m.reduceFinished = true
+	m.doneMut.Unlock()
+
 	return "", errors.New(ErrNoReduceTasks)
 }
 
 func (m *Master) ReduceTask(req *ReduceRequest, resp *ReduceResponse) error {
+	m.mut.Lock()
+
 	workerID := int(m.workerCount)
 
 	nextTaskFile, err := m.getNextReduceTask(workerID)
+	m.mut.Unlock()
+
 	if err != nil {
 		return err
 	}
 
 	resp.FileNum = nextTaskFile
+	resp.WorkerID = workerID
 	return nil
 }
 
-//
-// start a thread that listens for RPCs from worker.go
-//
+func (m *Master) JobComplete(req, resp *struct{}) error {
+	m.doneMut.Lock()
+	// fmt.Println("One Reduce Job finished")
 
-// TODO Let it work as is for now, eventually understand rpc.HandleHTTP() http.Serve() pattern.
+	m.completedJobs += 1
+
+	// ? Currently both cases return a nil error
+	// ? because I don't use the return value.
+	if m.completedJobs == m.nReduce {
+		m.allJobsComplete = true
+	}
+
+	m.doneMut.Unlock()
+	return nil
+}
+
+// TODO Understand how Http.Serve() functions in this context.
 func (m *Master) server() {
 	rpc.Register(m)
 
@@ -155,42 +185,31 @@ func (m *Master) server() {
 	go http.Serve(l, nil)
 }
 
-//
-// main/mrmaster.go calls Done() periodically to find out
-// if the entire job has finished.
-//
+// Done is called repeatedly by Mrmaster, to find out
+// Whether all Tasks have been completed.
+// This should return true, only when All Reduces have finished.
+// NOT when all Reduces have been allocated.
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
+	m.doneMut.Lock()
+	ret := m.allJobsComplete
+	m.doneMut.Unlock()
 	return ret
 }
 
-//
-// create a Master.
-// main/mrmaster.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
-
-// TODO understand where to call the master goroutine that repeat
-// TODO checks whether workers are performing their job.
-
-// ? Each of the Files corresponds to one split, and serves as an input
-// ? to a Map Worker task.
+// Master initialization function
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	m.nReduce = int8(nReduce)
+	m.nReduce = uint8(nReduce)
 
 	for _, f := range files {
 		m.mapTasks = append(m.mapTasks, MapTask{file: f})
 	}
-	fmt.Println("Map Tasks initialized")
+	// fmt.Println("Map Tasks initialized", len(m.mapTasks))
 
 	for i := 0; i < nReduce; i++ {
 		m.reduceTasks = append(m.reduceTasks, ReduceTask{file: strconv.Itoa(i)})
 	}
-	fmt.Println("Reduce Tasks initialized")
+	// fmt.Println("Reduce Tasks initialized")
 
 	m.server()
 	return &m

@@ -76,7 +76,7 @@ func main() {
 
 		for j < len(intermediate) && intermediate[i].Key == intermediate[j].Key {
 			keySlice = append(keySlice, intermediate[j].Key)
-			j += 1x
+			j += 1
 		}
 
 		count := redf(intermediate[i].Key, keySlice)

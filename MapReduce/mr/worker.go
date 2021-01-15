@@ -10,23 +10,29 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
 const (
-	StubFileName     = "mr"
-	ErrNoMapTasks    = "No Map Tasks left"
-	ErrNoReduceTasks = "No Reduce Tasks left"
+	StubFileName          = "mr"
+	ErrNoMapTasks         = "No Map Tasks left"
+	ErrNoReduceTasks      = "No Reduce Tasks left"
+	ErrMapNotFinished     = "Map Tasks are still left"
+	ErrMapAlreadyFinished = "Map Tasks have already finished"
 )
 
-//
+// Synchchronizes between the various Map GoRoutines invoked
+// From a single worker.
+var wg sync.WaitGroup
+
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
+// Functions to allow Sorting Intermediate Output Slices.
 type KeyValueArray []KeyValue
 
 func (kva KeyValueArray) Len() int {
@@ -41,64 +47,78 @@ func (kva KeyValueArray) Less(i, j int) bool {
 	return kva[i].Key < kva[j].Key
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
-// ? So as a worker traverses it's entire input file, it calls this method
-// ? for each keyvalue pair. So you are NOT creating the entire output, and then
-// ? splitting it up into various files.
-// ? You don't need to worry about concurrent write issues, because two goRoutines
-// ? can't simult. write to a file say mr-2-10. Only second worker writes to mr-2-*.
+// ihash(key) % NReduce allows Mapping each intermediate
+// Key-Value pair to a unique Reduce Worker.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-//
-// main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	// fmt.Println("Worker begin")
 
-	// Your worker implementation here.
+	for {
+		mr := CallMapTask()
 
-	// ? Here the worker should ask the Master for some task,
-	// ? Master should return a File and the worker number.
+		// An Empty (but Successful) Response indicates
+		// That all Map Tasks have been Allocated.
+		// TODO Replace with a response.Ok == false
+		if mr.FileName == "" {
+			// fmt.Printf("M[%s]Breaking\n", mr.WorkerID)
+			break
+		}
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+		// fmt.Printf("M[%s]Not Breaking\n", mr.WorkerID)
+		// fmt.Println("Allocating Map Task")
 
-	mr := CallMapTask()
-
-	// Valid response
-	if mr.FileName != "" {
-		fmt.Println("Allocating Map Task")
-		MapWorker(mr, mapf)
-		return
+		// ? Whenever you use a GoRoutine, you need to ensure that enclosing
+		// ? Function doesn't exit too soon. Waitgroups are your friend.
+		// ? Dont call add in a GoRoutine. Leads to races.
+		wg.Add(1)
+		go func(mr *MapResponse, mapf func(string, string) []KeyValue) {
+			MapWorker(mr, mapf)
+		}(mr, mapf)
 	}
 
-	// fmt.Println("Map Tasks are over")
-	// Reduce Workers
-	rr := CallReduceTask()
+	wg.Wait()
 
-	if rr.FileNum != "" {
-		fmt.Println("Allocating Reduce Task")
-		ReduceWorker(rr, reducef)
-		return
+	for {
+		// fmt.Println("Map Tasks are over")
+		// Reduce Workers
+		rr := CallReduceTask()
+
+		// fmt.Println("Allocating Reduce Task", rr.FileNum)
+
+		if rr.FileNum == "" {
+			// fmt.Printf("R[%d]Breaking\n", rr.WorkerID)
+			break
+		}
+
+		// fmt.Printf("R[%d]Not Breaking\n", rr.WorkerID)
+		// fmt.Println("Allocating Reduce Task")
+		wg.Add(1)
+		go func(rr *ReduceResponse, reducef func(string, []string) string) {
+			ReduceWorker(rr, reducef)
+			CallJobComplete()
+		}(rr, reducef)
 	}
+	wg.Wait()
 
-	fmt.Println("Received Invalid Reduce Response")
+	// fmt.Println("Received Invalid Reduce Response")
 	return
 }
 
 func MapWorker(mr *MapResponse, mapf func(string, string) []KeyValue) {
+	defer wg.Done()
+
 	// Now you may start working on your file.
 	workerFileName := StubFileName + "-" + mr.WorkerID // Of the form mr-0
 
 	// The input files are in the main/ directory.
-	file, err := os.Open("../main/" + mr.FileName)
+	// file, err := os.Open("../main/" + mr.FileName)
+	file, err := os.Open(mr.FileName)
 	if err != nil {
 		log.Fatalln("[Map Worker unable to open file]", err)
 	}
@@ -144,12 +164,11 @@ func MapWorker(mr *MapResponse, mapf func(string, string) []KeyValue) {
 }
 
 func ReduceWorker(rr *ReduceResponse, reducef func(string, []string) string) {
-	// Reponse contains the column number to scan across.
-	// Scan all, store in slice and sort.
-	// Then call reduce. Read up on how you should sort.
+	defer wg.Done()
 
 	intermedOut := []KeyValue{}
 
+	// TODO Not a very clean approach.
 	// TODO a better way would be to use rr.NWorkers.
 	for i := 0; ; i++ {
 		fileName := fmt.Sprintf("%s-%d-%s.txt", "mr", i, rr.FileNum)
@@ -157,7 +176,7 @@ func ReduceWorker(rr *ReduceResponse, reducef func(string, []string) string) {
 		file, err := os.Open(fileName)
 
 		if err != nil {
-			// fmt.Println("Failed at: ", fileName)
+			fmt.Println("Failed at: ", fileName)
 			break
 		}
 
@@ -209,14 +228,16 @@ func CallMapTask() *MapResponse {
 		ok = call("Master.MapTask", mreq, mresp)
 
 		if ok {
+			// fmt.Println("Return Map Response")
 			return mresp
 		}
 		time.Sleep(1 * time.Second)
+		// fmt.Println("Try CallMapTask again")
 	}
 }
 
 func CallReduceTask() *ReduceResponse {
-	fmt.Println("Calling Reduce Task")
+	// fmt.Println("Calling Reduce Task")
 
 	rreq := &ReduceRequest{}
 	rresp := &ReduceResponse{}
@@ -232,34 +253,15 @@ func CallReduceTask() *ReduceResponse {
 	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+// Called by each reduce when it's task is Finished.
+func CallJobComplete() {
+	var req, resp struct{}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	call("Master.JobComplete", &req, &resp)
 }
 
-//
-// send an RPC request to the master, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
+// Send an RPC request to the master, wait for the response.
+// Returns false if something goes wrong.
 
 // TODO understand this (again)
 func call(rpcname string, args interface{}, reply interface{}) bool {
@@ -272,7 +274,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil || err.Error() == ErrNoMapTasks || err.Error() == ErrNoReduceTasks {
+	if err == nil || err.Error() == ErrMapAlreadyFinished || err.Error() == ErrNoReduceTasks {
 		return true
 	}
 
